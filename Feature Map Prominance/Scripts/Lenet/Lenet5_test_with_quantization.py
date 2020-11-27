@@ -8,24 +8,60 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import numpy as np
 from Lenet5 import LeNet5
+import sys
+import pickle
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+quant_func_file_path = "D:/University Academics/Research_Works/Scripts/Dynamic Pruning Scripts/Feature Map Prominance/Scripts/Quantization_Deployed"
+sys.path.append(quant_func_file_path)
+
+from Quant_funcs import *
+
+device = torch.device('cpu')
 print('Device: ', device)
 
 N_CLASSES = 10
 PATH = "./lenet5_net_15.pth"
 BATCH_SIZE = 32
+QUANT_BIT_WIDTH = 8
 num_of_conv_layers = 3
 num_of_train_imgs = 60000
 num_of_test_imgs = 10000
 running_mean_list = []
 count_all_list = []
 map_count_all_list = []
-threshold_mask = []
+threshold_mask = [] 
 layer_num = 0
 threshold = 0.36725923556285905
 mean_scale = -0.3999999999999999
 data_size = BATCH_SIZE
+#####################################
+# for test
+mask_flag = 1
+
+with open ('quantization_activation_values.txt', 'rb') as fp:
+    quant_act_values = pickle.load(fp)
+
+with open('quantization_weight_values.txt', 'rb') as fm:
+    quant_weigh_values = pickle.load(fm)
+
+def data_iter(dataset_loader, device = device):
+    with torch.no_grad():
+        dataiter = iter(dataset_loader)
+        data = dataiter.next()
+        images, labels = data[0].to(device), data[1].to(device)
+        outputs = net(images)
+        _, predicted = torch.max(outputs[0].data, 1)
+        print("Outputs : {}".format(outputs[0][:10]))
+        print("Labels : {}".format(labels[:10]))
+        print("Prdicted Labels : {}".format(predicted[:10]))
+
+def first_conv_quantization_hook(self, input):
+    global layer_num
+    global mask_flag
+    if(mask_flag == 1):
+        layer_num += 1
+        for i,data in enumerate(input[0], 0):
+            input[0][i] = quantize_array( input[0][i], quant_act_values[ layer_num - 1 ] )
 
 def running_mean_var_thresholding_and_masking_with_fixed_mean(self, input):
     global running_mean_list
@@ -38,15 +74,17 @@ def running_mean_var_thresholding_and_masking_with_fixed_mean(self, input):
     global mean_scale
     global threshold
     global data_size
+    global quant_act_values
     data_size = input[0].size()[0]
     if(mask_flag == 0):
         running_mean_list.append(input[0].mean(dim=(2,3)).sum(dim=0))
     elif(mask_flag == 1):
         layer_num += 1
-        map_count = input[0].size()[0] * input[0].size()[1]
-        map_count_list = [ input[0].size()[1] ] * input[0].size()[0]
-        x_mean = mean[ layer_num - 1 ].unsqueeze(dim = 1).unsqueeze(dim = 2)
-        var = ( ( input[0] - mean_scale * x_mean ) ** 2 ).sum(dim=(2,3))
+        quantized_input = quantize_array(input[0], quant_act_values[layer_num - 1])
+        map_count = quantized_input.size()[0] * quantized_input.size()[1]
+        map_count_list = [ quantized_input.size()[1] ] * quantized_input.size()[0]
+        x_mean = quantize_array( mean[ layer_num - 2 ], quant_act_values[ layer_num - 1 ] ).unsqueeze(dim = 1).unsqueeze(dim = 2)
+        var = ( ( quantized_input - mean_scale * x_mean ) ** 2 ).sum(dim=(2,3))
         max_var = var.max(dim=1).values
         count = ( var <= max_var.unsqueeze(dim=1) * threshold ).sum().item()
         count_list = ( var <= max_var.unsqueeze(dim=1) * threshold ).sum(dim=1).tolist()
@@ -73,15 +111,17 @@ def running_mean_abs_thresholding_and_masking_with_fixed_mean(self, input):
     global mean_scale
     global threshold
     global data_size
+    global quant_act_values
     data_size = input[0].size()[0]
     if(mask_flag == 0):
         running_mean_list.append(input[0].mean(dim=(2,3)).sum(dim=0))
     elif(mask_flag == 1):
         layer_num += 1
-        map_count = input[0].size()[0] * input[0].size()[1]
-        map_count_list = [ input[0].size()[1] ] * input[0].size()[0]
-        x_mean = mean[ layer_num - 1 ].unsqueeze(dim = 1).unsqueeze(dim = 2)
-        x_abs = ( input[0] - mean_scale * x_mean ).abs().sum(dim=(2,3))
+        quantized_input = quantize_array(input[0], quant_act_values[layer_num - 1])
+        map_count = quantized_input.size()[0] * quantized_input.size()[1]
+        map_count_list = [ quantized_input.size()[1] ] * quantized_input.size()[0]
+        x_mean = quantize_array( mean[ layer_num - 2 ], quant_act_values[ layer_num - 1 ] ).unsqueeze(dim = 1).unsqueeze(dim = 2)
+        x_abs = ( quantized_input - mean_scale * x_mean ).abs().sum(dim=(2,3))
         max_abs = x_abs.max(dim=1).values
         count = ( x_abs <= max_abs.unsqueeze(dim=1) * threshold ).sum().item()
         count_list = ( x_abs <= max_abs.unsqueeze(dim=1) * threshold ).sum(dim=1).tolist()
@@ -209,98 +249,121 @@ net = torch.load(PATH)
 net.eval()
 net.to(device)
 
-# Hooking intermediate layer
+# # Hooking intermediate layer
+# for name,module in net.named_modules():
+#     if( name == "feature_extractor.0" ):
+#         module.register_forward_pre_hook(first_conv_quantization_hook)
+#     elif( name == "feature_extractor.3" or name == "feature_extractor.6" ):
+#         module.register_forward_pre_hook(running_mean_abs_thresholding_and_masking_with_fixed_mean)
+
+# # Calculating expected accuracy
+# print('Training Dataset Accuracy Calculation!!!!!!!!!!!!!')
+# exp_accuracy = dataset_accuracy_calc(train_loader)
+# print('Expected Accuracy for Calibration Dataset: {}'.format(exp_accuracy))
+
+# print('Static Mean Calculation Started!!!!!!!!!!!!')
+# # Average mean calculation of each channel
+# mean = static_mean_calc(train_loader)
+
+# Weights and biases quantization
+with torch.no_grad():
+    params = net.state_dict()
+    layer_names = []
+    for weight_name in net.state_dict():
+        layer_names.append(weight_name)
+        # if( weight_name != "classifier.0.weight" and weight_name != "classifier.0.bias" and weight_name != "classifier.2.weight" and weight_name != "classifier.2.bias" ):
+        params[ weight_name ] = quantize_array( params[ weight_name ], quant_weigh_values[ weight_name ] )
+
+    index = 0
+    for parameters in net.parameters():
+        parameters.data = params[ layer_names[index] ].type(torch.FloatTensor)
+        index += 1
+
+# print('Learned Threshold Check for Test Dataset!!!!!!!')
+# baseline_test_accuracy = dataset_accuracy_calc(valid_loader)
+# test_dataset_accuracy = static_mean_accuracy_drop_calc(valid_loader, train = False)
+# print('Test Accuracy Drop: {}'.format(baseline_test_accuracy - test_dataset_accuracy[0]))
+# print('Layer by Layer FLOP Drop Percentages for Test dataset: {}'.format(test_dataset_accuracy[1]))
+# print('Avg FLOP Drop Percentages for Test Dataset: {}'.format(avg_flop_drop_calc(test_dataset_accuracy[1])))
+
 for name,module in net.named_modules():
-    if( name == "feature_extractor.3" or name == "feature_extractor.6" ):
-        module.register_forward_pre_hook(running_mean_abs_thresholding_and_masking_with_fixed_mean)
+    if( name == "feature_extractor.0" or name == "feature_extractor.3" or name == "feature_extractor.6" or name == "classifier.0" or name == "classifier.2" ):
+        module.register_forward_pre_hook(first_conv_quantization_hook)
 
-# Calculating expected accuracy
-print('Training Dataset Accuracy Calculation!!!!!!!!!!!!!')
-exp_accuracy = dataset_accuracy_calc(train_loader)
-print('Expected Accuracy for Calibration Dataset: {}'.format(exp_accuracy))
-
-print('Static Mean Calculation Started!!!!!!!!!!!!')
-# Average mean calculation of each channel
-mean = static_mean_calc(train_loader)
-
-print('Threshold Learning for Calibration Dataset!!!!!!!')
-info = []
-accuracy_drop_list = []
-mean_scale_list = []
-threshold_list = []
-while(True):
-    state = False
-    while(state == False):
-        actual_accuracy, percent = static_mean_accuracy_drop_calc(train_loader)
-        print('Accuracy of the network on the 10000 Calibration images: {}'.format(actual_accuracy))
-        target_FLOP_drop_percent = 40
-        const = 0.001
-        flop_drop_percent = avg_flop_drop_calc(percent)
-        target_drop_error = flop_drop_percent - target_FLOP_drop_percent
-        print('AVG FLOP drop percentage for Cal Dataset: {}'.format(flop_drop_percent))
-        print('Layer by Layer FLOP Drop for Cal Dataset: {}'.format(percent))
-        print('FLOP drop Error for Cal Dataset: {}'.format(target_drop_error))
-        print('Accuracy Drop: {}'.format(exp_accuracy - actual_accuracy))
-        if(abs(target_drop_error) <= 1):
-            state = True
-            print('Optimum Threshold Value: {}'.format(threshold))
-            # print('AVG FLOP drop percentage for Cal Dataset: {}'.format(flop_drop_percent))
-            # print('FLOP drop Error for Cal Dataset: {}'.format(target_drop_error))
-            # print('Layer by Layer FLOP Drop for Cal Dataset: {}'.format(percent))
-        else:
-            threshold = threshold - const * target_drop_error
-            print( 'Threshold: {}'.format(threshold) )
-            print('###########################################################################')
-            state = False
-    pre_mean_scale = mean_scale
-    mean_scale -= 0.1
-    accuracy_drop = exp_accuracy - actual_accuracy
-    if(mean_scale < -1.0):
-        min_accuracy_index = accuracy_drop_list.index(min(accuracy_drop_list))
-        mean_scale = mean_scale_list[min_accuracy_index]
-        threshold = threshold_list[min_accuracy_index]
-        print('Information List: {}'.format(info[min_accuracy_index]))
-        break
-    else:
-        accuracy_drop_list.append(accuracy_drop)
-        info.append(['Accuracy of the network on the 10000 Calibration images: %.2f %%' % (actual_accuracy), 
-                      'AVG FLOP drop percentage for Cal Dataset: {}'.format(flop_drop_percent), 
-                      'Layer by Layer FLOP Drop for Cal Dataset: {}'.format(percent),
-                      'FLOP drop Error for Cal Dataset: {}'.format(target_drop_error),
-                      'Optimum Mean Scale: {}'.format(pre_mean_scale),
-                      'Optimum Threshold: {}'.format(threshold)])
-        mean_scale_list.append(pre_mean_scale)
-        threshold_list.append(threshold)
-
-print('Learned Threshold Check for Test Dataset!!!!!!!')
-baseline_test_accuracy = dataset_accuracy_calc(valid_loader)
-test_dataset_accuracy_drop = static_mean_accuracy_drop_calc(valid_loader, train = False)
-print('Test Accuracy Drop: {}'.format(baseline_test_accuracy - test_dataset_accuracy_drop[0]))
-print('Layer by Layer FLOP Drop Percentages for Test dataset: {}'.format(test_dataset_accuracy_drop[1]))
-print('Avg FLOP Drop Percentages for Test Dataset: {}'.format(avg_flop_drop_calc(test_dataset_accuracy_drop[1])))
+data_iter(valid_loader)
 
 # Results
-# Double Iteration Static Mean
-# ABS method
-# Expected accuracy: 99.80 %
-# Accuracy of the network on the 10000 Calibration images: 99.71 %
-# AVG FLOP drop percentage for Cal Dataset: 19.09516447368421
-# Layer by Layer FLOP Drop for Cal Dataset: [0.0, 20.851041666666667, 20.851041666666667]
-# FLOP drop Error for Cal Dataset: -0.9048355263157895
-# Optimum Mean Scale: -0.09999999999999987
-# Optimum Threshold: 0.17814546637426915
+# Quantization of static mean ABS method for inference phase
+# Target FLOP drops = 40%
+# 8 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
 # Learned Threshold Check for Test Dataset!!!!!!!
-# Test Accuracy Drop: 0.060000000000002274
-# Layer by Layer FLOP Drop Percentages for Test dataset: [0.0, 20.819375, 20.819375]
-# Avg FLOP Drop Percentages for Test Dataset: 19.066164473684207
+# Test Accuracy Drop: 1.0499999999999972
+# Layer by Layer FLOP Drop Percentages for Test dataset: [1.0333333333333408, 42.57499999999991, 42.333125]
+# Avg FLOP Drop Percentages for Test Dataset: 38.917626096491205
 
-# Accuracy of the network on the 10000 Calibration images: 98.85 %
-# AVG FLOP drop percentage for Cal Dataset: 39.04894033260248
-# Layer by Layer FLOP Drop for Cal Dataset: [1.0158333333333351, 42.71335069444498, 42.48072916666666]
-# FLOP drop Error for Cal Dataset: -0.9510596673975229
-# Optimum Mean Scale: -0.3999999999999999
-# Optimum Threshold: 0.36725923556285905
+# 5 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
 # Learned Threshold Check for Test Dataset!!!!!!!
-# Test Accuracy Drop: 0.9899999999999949
-# Layer by Layer FLOP Drop Percentages for Test dataset: [1.066666666666675, 42.58020833333324, 42.331875000000004]
-# Avg FLOP Drop Percentages for Test Dataset: 38.920953947368396
+# Test Accuracy Drop: 1.0300000000000011
+# Layer by Layer FLOP Drop Percentages for Test dataset: [1.904999999999977, 42.87687499999987, 42.325625]
+# Avg FLOP Drop Percentages for Test Dataset: 39.06394736842101
+
+# 4 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
+# Learned Threshold Check for Test Dataset!!!!!!!
+# Test Accuracy Drop: 5.240000000000009
+# Layer by Layer FLOP Drop Percentages for Test dataset: [0.0, 63.931875000000005, 63.931875000000005]
+# Avg FLOP Drop Percentages for Test Dataset: 58.54813815789473
+
+# 3 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
+# Learned Threshold Check for Test Dataset!!!!!!!
+# Test Accuracy Drop: 14.329999999999998
+# Layer by Layer FLOP Drop Percentages for Test dataset: [11.103333333333328, 70.3314583333333, 66.849375]
+# Avg FLOP Drop Percentages for Test Dataset: 63.05298245614035
+
+# Target FLOP drops = 20%
+# 8 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
+# Learned Threshold Check for Test Dataset!!!!!!!
+# Test Accuracy Drop: 0.030000000000001137
+# Layer by Layer FLOP Drop Percentages for Test dataset: [0.0, 20.808125, 20.808125]
+# Avg FLOP Drop Percentages for Test Dataset: 19.055861842105262
+
+# 5 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
+# Learned Threshold Check for Test Dataset!!!!!!!
+# Test Accuracy Drop: 0.06999999999999318
+# Layer by Layer FLOP Drop Percentages for Test dataset: [0.0, 23.7875, 23.7875]
+# Avg FLOP Drop Percentages for Test Dataset: 21.78434210526316
+
+# 4 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
+# Learned Threshold Check for Test Dataset!!!!!!!
+# Test Accuracy Drop: 0.38000000000000966
+# Layer by Layer FLOP Drop Percentages for Test dataset: [0.0, 30.446250000000003, 30.446250000000003]
+# Avg FLOP Drop Percentages for Test Dataset: 27.882355263157898
+
+# 3 bit quantization
+# Training Dataset Accuracy Calculation!!!!!!!!!!!!!
+# Expected Accuracy for Calibration Dataset: 99.8
+# Static Mean Calculation Started!!!!!!!!!!!!
+# Learned Threshold Check for Test Dataset!!!!!!!
+# Test Accuracy Drop: 2.3200000000000074
+# Layer by Layer FLOP Drop Percentages for Test dataset: [0.20500000000000007, 40.83666666666667, 40.739999999999995]
+# Avg FLOP Drop Percentages for Test Dataset: 37.351456140350884

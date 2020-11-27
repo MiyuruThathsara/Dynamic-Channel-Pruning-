@@ -7,17 +7,35 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import numpy as np
+from Lenet5 import LeNet5
+import sys
+import pickle
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+quant_func_file_path = "D:/University Academics/Research_Works/Scripts/Dynamic Pruning Scripts/Feature Map Prominance/Scripts/Quantization_Deployed"
+sys.path.append(quant_func_file_path)
+
+from Quant_funcs import *
+
+device = torch.device('cpu')
 print('Device: ', device)
 
+N_CLASSES = 10
 PATH = "./lenet5_net_15.pth"
 BATCH_SIZE = 32
-feature_map = []
+QUANT_BIT_WIDTH = 8
+layer_num = 0
+quantized_images = []
 
-def feature_map_extract(self, input):
-    global feature_map
-    feature_map = input[0][:10]
+with open ('quantization_activation_values.txt', 'rb') as fp:
+    quant_act_values = pickle.load(fp)
+
+def first_conv_quantization_to_levels_hook(self, input):
+    global quantized_images
+    global layer_num
+    layer_num += 1
+    for i,data in enumerate(input[0], 0):
+        input[0][i] = quantize_array_to_levels( input[0][i], quant_act_values[ layer_num - 1 ] )
+    quantized_images = input[0];
 
 def data_iter(dataset_loader, device = device):
     with torch.no_grad():
@@ -61,27 +79,24 @@ net.to(device)
 
 for name,module in net.named_modules():
     if( name == "feature_extractor.0" ):
-        module.register_forward_pre_hook(feature_map_extract)
+        module.register_forward_pre_hook(first_conv_quantization_to_levels_hook)
 
 data_iter(valid_loader)
 
-data_shape = feature_map.shape
-shape = (120,32,32)
-
-for i1 in range(data_shape[0]):
-    val_str = "image[120][32][32] = {"
-    for i2 in range(shape[0]):
-        val_str += "{"
-        for i3 in range(shape[1]):
-            val_str += "{"
-            for i4 in range(shape[2]):
-                if( i2 < data_shape[1]):
-                    val_str += " " + str(feature_map[i1][i2][i3][i4].item()) + ","
-                else:
-                    val_str += " 0,"
-            val_str = val_str[:-1] + "},\n"
-        val_str = val_str[:-2] + "},\n"
-    val_str = val_str[:-2] + "}\n\n"
-    act_file = open("Input_image" + str(i1+1) + ".txt", "w")
-    act_file.write(val_str)
-    act_file.close()
+quant_image_size = quantized_images.size()
+for i1 in range(quant_image_size[0]):
+    if(i1 < 10):
+        file_name = "Results/Input_image_" + str(i1 + 1) + "_quantized_to_levels.txt"
+        file = open(file_name, "w")
+        str_array = "ap_int<" + str(QUANT_BIT_WIDTH) + "> image_array[" + str(quant_image_size[1]) + "][" + str(quant_image_size[2]) + "][" + str(quant_image_size[3]) + "] = {"
+        for i2 in range(quant_image_size[1]):
+            str_array += "{"
+            for i3 in range(quant_image_size[2]):
+                str_array += "{"
+                for i4 in range(quant_image_size[3]):
+                    str_array += str(int(quantized_images[i1][i2][i3][i4].item())) + ", "
+                str_array = str_array[:-2] + "},\n"
+            str_array = str_array[:-2] + "},\n"
+        str_array = str_array[:-2] + "}"
+        file.write(str_array)
+        file.close()
